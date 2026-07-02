@@ -22,37 +22,27 @@ import io.github.proify.lyricon.smprovider.xposed.Constants.PROVIDER_PACKAGE_NAM
 import java.lang.reflect.Field
 
 /**
- * 锤子音乐（SmartisanOS Music）LSP 歌词提供者。
+ * 锤子音乐（Smartisan Music Revived）LSP 歌词提供者。
  *
  * 钩子策略：
- * 1. MediaSession.setMetadata() — 获取歌曲基本信息（标题、歌手、时长）
- * 2. NowPlayingLyricsRepository.peek() — 拦截已解析的 EmbeddedLyrics 对象
- * 3. MediaMetadata.extras — 读取自定义歌词键（在线歌词）
+ * 1. MediaSession.setMetadata() — 获取歌曲信息，扫描 extras 中所有键找歌词
+ * 2. NowPlayingLyricsRepository — 拦截已解析的 EmbeddedLyrics 对象
+ * 3. MediaSession.setPlaybackState() — 同步播放状态
  */
 object SmartisanMusic : YukiBaseHooker() {
     private const val TAG = "SmartisanMusicProvider"
 
-    // 锤子音乐自定义歌词键（存储在 MediaMetadata.extras 中）
-    private const val ONLINE_LYRICS_KEY = "com.smartisanos.music.extra.ONLINE_LYRICS"
-    private const val ONLINE_TRANSLATED_LYRICS_KEY = "com.smartisanos.music.extra.ONLINE_TRANSLATED_LYRICS"
-    private const val ONLINE_WORD_LYRICS_KEY = "com.smartisanos.music.extra.ONLINE_WORD_LYRICS"
-    private const val ONLINE_TRANSLATED_WORD_LYRICS_KEY = "com.smartisanos.music.extra.ONLINE_TRANSLATED_WORD_LYRICS"
-
     private val providerManager by lazy { LyricProviderManager() }
 
     override fun onHook() {
-        when (processName) {
-            packageName -> {
-                YLog.info(tag = TAG, msg = "Hooking $processName")
-                providerManager.onHook()
-            }
-        }
+        // 不限制 processName，确保在所有进程中都生效
+        YLog.info(tag = TAG, msg = "onHook called, processName=$processName, packageName=$packageName")
+        providerManager.onHook()
     }
 
     private class LyricProviderManager {
         private var lyricProvider: LyriconProvider? = null
         private var lastSong: Song? = null
-        private var currentMediaId: Long = 0
         private var currentSongTitle: String? = null
         private var currentSongArtist: String? = null
         private var currentSongDuration: Long = 0
@@ -80,93 +70,97 @@ object SmartisanMusic : YukiBaseHooker() {
                 register()
             }
 
-            YLog.info(tag = TAG, msg = "Lyricon provider registered")
+            YLog.info(tag = TAG, msg = "Lyricon provider registered, app=${application.packageName}")
         }
 
         // ---------------------------------- MediaSession 钩子 ----------------------------------
 
         private fun hookMediaSession() {
-            "android.media.session.MediaSession".toClass()
-                .apply {
-                    firstMethod {
-                        name = "setMetadata"
-                        parameters(MediaMetadata::class.java)
-                    }.hook {
-                        after {
-                            val metadata = args[0] as? MediaMetadata ?: return@after
-                            val title = metadata.getString(MediaMetadata.METADATA_KEY_TITLE) ?: return@after
-                            val artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST)
-                            val duration = metadata.getLong(MediaMetadata.METADATA_KEY_DURATION)
-                            val id = title.hashCode().toLong()
+            try {
+                "android.media.session.MediaSession".toClass()
+                    .apply {
+                        firstMethod {
+                            name = "setMetadata"
+                            parameters(MediaMetadata::class.java)
+                        }.hook {
+                            after {
+                                val metadata = args[0] as? MediaMetadata
+                                if (metadata == null) {
+                                    YLog.debug(tag = TAG, msg = "setMetadata called but metadata is null")
+                                    return@after
+                                }
 
-                            if (currentMediaId == id && currentSongTitle == title) return@after
+                                val title = metadata.getString(MediaMetadata.METADATA_KEY_TITLE)
+                                val artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST)
+                                val duration = metadata.getLong(MediaMetadata.METADATA_KEY_DURATION)
 
-                            currentMediaId = id
-                            currentSongTitle = title
-                            currentSongArtist = artist
-                            currentSongDuration = duration
+                                YLog.info(tag = TAG, msg = "setMetadata: title=$title, artist=$artist, duration=$duration")
 
-                            YLog.debug(tag = TAG, msg = "Song changed: $title - $artist")
+                                if (title == null) return@after
 
-                            // 尝试从 extras 中读取在线歌词
-                            val lyricsFromExtras = extractLyricsFromExtras(metadata)
-                            if (lyricsFromExtras != null) {
-                                YLog.debug(tag = TAG, msg = "Got lyrics from MediaMetadata.extras")
-                                setSongWithLyrics(title, artist, duration, lyricsFromExtras)
-                                return@after
+                                if (currentSongTitle == title) return@after
+
+                                currentSongTitle = title
+                                currentSongArtist = artist
+                                currentSongDuration = duration
+
+                                // 尝试从 extras 中扫描歌词
+                                val lyricsFromExtras = extractLyricsFromExtras(metadata)
+                                if (lyricsFromExtras != null) {
+                                    YLog.info(tag = TAG, msg = "Got lyrics from extras (${lyricsFromExtras.take(80)}...)")
+                                    setSongWithLyrics(title, artist, duration, lyricsFromExtras)
+                                    return@after
+                                }
+
+                                // 尚无歌词，后续由 NowPlayingLyricsRepository 钩子补充
+                                setSongBasic(title, artist, duration)
                             }
+                        }
 
-                            // 尚无歌词，只设置基本信息
-                            setSongBasic(title, artist, duration)
+                        firstMethod {
+                            name = "setPlaybackState"
+                            parameters(PlaybackState::class.java)
+                        }.hook {
+                            after {
+                                val state = args[0] as? PlaybackState
+                                lyricProvider?.player?.setPlaybackState(state)
+                            }
                         }
                     }
 
-                    firstMethod {
-                        name = "setPlaybackState"
-                        parameters(PlaybackState::class.java)
-                    }.hook {
-                        after {
-                            val state = args[0] as? PlaybackState
-                            lyricProvider?.player?.setPlaybackState(state)
-                        }
-                    }
-                }
+                YLog.info(tag = TAG, msg = "MediaSession hooks installed")
+            } catch (e: Exception) {
+                YLog.warn(tag = TAG, msg = "Failed to hook MediaSession: ${e.message}")
+            }
         }
 
         // ---------------------------------- NowPlayingLyricsRepository 钩子 ----------------------------------
 
-        /**
-         * Hook NowPlayingLyricsRepository 的方法，拦截已解析的 EmbeddedLyrics。
-         * 这是最可靠的歌词来源，因为锤子音乐已经完成了所有解析工作。
-         *
-         * 类路径: com.smartisanos.music.playback.NowPlayingLyricsRepository
-         * 关键方法:
-         *   - peek(MediaItem): EmbeddedLyrics?  — 同步缓存查询
-         *   - load(Context, MediaItem, Boolean): EmbeddedLyrics? — 异步加载
-         */
         private fun hookNowPlayingLyricsRepository() {
             try {
                 val repoClass = "com.smartisanos.music.playback.NowPlayingLyricsRepository".toClass()
 
-                // Hook peek() — 缓存查询，每次歌词变更都会触发
+                // Hook peek() — 缓存查询
                 repoClass.method {
                     name = "peek"
                 }.forEach { method ->
                     method.hook {
                         after {
                             val result = this.result ?: return@after
+                            YLog.debug(tag = TAG, msg = "peek() returned: ${result.javaClass.simpleName}")
                             processEmbeddedLyrics(result)
                         }
                     }
                 }
 
-                // Hook load() — 异步加载完成后的回调
+                // Hook load() — 异步加载
                 repoClass.method {
                     name = "load"
                 }.forEach { method ->
                     method.hook {
                         after {
                             val result = this.result ?: return@after
+                            YLog.debug(tag = TAG, msg = "load() returned: ${result.javaClass.simpleName}")
                             processEmbeddedLyrics(result)
                         }
                     }
@@ -179,11 +173,13 @@ object SmartisanMusic : YukiBaseHooker() {
         }
 
         /**
-         * 通过反射处理 EmbeddedLyrics 对象，转换为 RichLyricLine 列表。
+         * 通过反射处理 EmbeddedLyrics 对象。
          */
         private fun processEmbeddedLyrics(lyricsObj: Any) {
             try {
                 val objClass = lyricsObj.javaClass
+                YLog.debug(tag = TAG, msg = "processEmbeddedLyrics: class=${objClass.name}, fields=${objClass.declaredFields.joinToString { it.name }}")
+
                 val linesField = getField(objClass, "lines") ?: return
                 val lines = linesField.get(lyricsObj) as? List<*> ?: return
                 if (lines.isEmpty()) return
@@ -195,7 +191,7 @@ object SmartisanMusic : YukiBaseHooker() {
                 val richLines = convertEmbeddedLines(lines)
                 if (richLines.isEmpty()) return
 
-                YLog.debug(tag = TAG, msg = "Processed ${richLines.size} lyrics lines for: $title")
+                YLog.info(tag = TAG, msg = "Processed ${richLines.size} lyrics lines for: $title")
 
                 setSong(
                     Song(
@@ -214,17 +210,6 @@ object SmartisanMusic : YukiBaseHooker() {
 
         /**
          * 将 EmbeddedLyricsLine 列表转换为 RichLyricLine 列表。
-         *
-         * EmbeddedLyricsLine 字段:
-         *   - text: String
-         *   - timestampMs: Long?
-         *   - translation: String?
-         *   - tokens: List<EmbeddedLyricsToken>
-         *
-         * EmbeddedLyricsToken 字段:
-         *   - text: String
-         *   - timestampMs: Long
-         *   - endTimestampMs: Long?
          */
         private fun convertEmbeddedLines(lines: List<*>): List<RichLyricLine> {
             return lines.mapNotNull { lineObj ->
@@ -240,9 +225,8 @@ object SmartisanMusic : YukiBaseHooker() {
                     val translation = translationField?.get(lineObj) as? String
 
                     val begin = timestampMs
-                    val end = begin + 5000 // 默认 5 秒，实际会被下一行覆盖
+                    val end = begin + 5000
 
-                    // 解析逐字时间轴
                     val tokens = tokensField?.get(lineObj) as? List<*>
                     val words = if (tokens != null && tokens.isNotEmpty()) {
                         tokens.mapNotNull { tokenObj ->
@@ -275,9 +259,6 @@ object SmartisanMusic : YukiBaseHooker() {
             }
         }
 
-        /**
-         * 通过反射获取字段（包括父类和私有字段）。
-         */
         private fun getField(clazz: Class<*>, name: String): Field? {
             var current: Class<*>? = clazz
             while (current != null && current != Any::class.java) {
@@ -295,7 +276,8 @@ object SmartisanMusic : YukiBaseHooker() {
         // ---------------------------------- Extras 歌词提取 ----------------------------------
 
         /**
-         * 从 MediaMetadata.extras 中提取锤子音乐的自定义歌词。
+         * 从 MediaMetadata.extras 中扫描所有键，查找歌词内容。
+         * 不依赖硬编码的 key 名，而是扫描所有 extras 键值。
          */
         private fun extractLyricsFromExtras(metadata: MediaMetadata): String? {
             return try {
@@ -303,11 +285,47 @@ object SmartisanMusic : YukiBaseHooker() {
                 extrasField.isAccessible = true
                 val bundle = extrasField.get(metadata) as? Bundle ?: return null
 
-                // 优先使用逐字歌词（YRC），其次是标准歌词（LRC）
-                bundle.getString(ONLINE_WORD_LYRICS_KEY)
-                    ?: bundle.getString(ONLINE_LYRICS_KEY)
+                val keys = bundle.keySet()
+                YLog.debug(tag = TAG, msg = "extras keys: $keys")
+
+                // 先尝试已知的常见键名
+                val knownKeys = listOf(
+                    "com.smartisanos.music.extra.ONLINE_WORD_LYRICS",
+                    "com.smartisanos.music.extra.ONLINE_LYRICS",
+                    "com.smartisanos.music.extra.ONLINE_TRANSLATED_LYRICS",
+                    "com.smartisanos.music.extra.ONLINE_TRANSLATED_WORD_LYRICS",
+                    "OnlineLyricsExtraKey",
+                    "OnlineWordLyricsExtraKey",
+                    "ONLINE_LYRICS",
+                    "ONLINE_WORD_LYRICS",
+                )
+
+                for (key in knownKeys) {
+                    if (key in keys) {
+                        val lyrics = bundle.getString(key)
+                        if (lyrics != null && lyrics.contains("[")) {
+                            YLog.info(tag = TAG, msg = "Found lyrics with known key: $key")
+                            return lyrics
+                        }
+                    }
+                }
+
+                // 扫描所有键，找包含 LRC 时间标签的内容
+                for (key in keys) {
+                    val value = bundle.getString(key) ?: continue
+                    // LRC 格式: 包含 [mm:ss.xx] 或 [mm:ss]
+                    if (value.length > 20 && value.contains("[")) {
+                        val lrcPattern = Regex("\\[\\d{2}:\\d{2}[.\\d]*\\]")
+                        if (lrcPattern.containsMatchIn(value)) {
+                            YLog.info(tag = TAG, msg = "Found lyrics by scanning: key=$key, preview=${value.take(80)}")
+                            return value
+                        }
+                    }
+                }
+
+                null
             } catch (e: Exception) {
-                YLog.debug(tag = TAG, msg = "Failed to read extras: ${e.message}")
+                YLog.warn(tag = TAG, msg = "Failed to read extras: ${e.message}")
                 null
             }
         }
@@ -340,12 +358,10 @@ object SmartisanMusic : YukiBaseHooker() {
         private fun setSong(song: Song) {
             if (lastSong == song) return
             lastSong = song
+            YLog.info(tag = TAG, msg = "Setting song: ${song.name}, lyrics=${song.lyrics?.size ?: 0} lines")
             lyricProvider?.player?.setSong(song)
         }
 
-        /**
-         * 将 LRC 文本解析为 RichLyricLine 列表。
-         */
         private fun parseLyricsToRichLines(text: String): List<RichLyricLine> {
             return try {
                 val doc = io.github.proify.lrckit.EnhanceLrcParser.parse(text.trim())
