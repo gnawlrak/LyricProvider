@@ -1,0 +1,19 @@
+<!--
+  ~ Copyright 2026 Proify, Tomakino
+  ~ Licensed under the Apache License, Version 2.0
+  -->
+
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="1024"
+    android:viewportHeight="1024">
+  <group android:scaleX="0.4"
+      android:scaleY="0.4"
+      android:translateX="307.2"
+      android:translateY="307.2">
+    <path
+        android:pathData="M864,256c0,-53 -43,-96 -96,-96H256c-53,0 -96,43 -96,96v512c0,53 43,96 96,96h512c53,0 96,-43 96,-96V256zM736,352L480,608c-10,10 -23,15 -37,15h-50c-14,0 -27,-5 -37,-15l-80,-80c-10,-10 -15,-23 -15,-37s5,-27 15,-37c10,-10 23,-15 37,-15s27,5 37,15l43,43 219,-219c10,-10 23,-15 37,-15s27,5 37,15c10,10 15,23 15,37s-5,27 -15,37z"
+        android:fillColor="#ffffff"/>
+  </group>
+</vector>
