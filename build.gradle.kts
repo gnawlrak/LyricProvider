@@ -23,8 +23,8 @@ plugins {
     alias(libs.plugins.jetbrains.kotlin.jvm) apply false
 }
 
-extra["compileSdkVersion"] = 37
-extra["targetSdkVersion"] = 37
+extra["compileSdkVersion"] = 36
+extra["targetSdkVersion"] = 36
 
 /**
  * 1. 注册清理任务
