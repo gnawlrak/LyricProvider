@@ -8,6 +8,7 @@ import com.android.build.api.dsl.ApplicationExtension
 
 plugins {
     alias(libs.plugins.android.application)
+    alias(libs.plugins.kotlin.android)
     alias(libs.plugins.ksp)
     kotlin("plugin.serialization") version "2.1.21"
 }
@@ -37,7 +38,7 @@ configure<ApplicationExtension> {
 
     buildTypes {
         getByName("debug") {
-            signingConfig = signingConfigs.getByName("release")
+            // use default debug keystore for local development
         }
         getByName("release") {
             signingConfig = signingConfigs.getByName("release")

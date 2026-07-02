@@ -9,6 +9,7 @@ package io.github.proify.lyricon.smprovider.xposed
 import android.media.MediaMetadata
 import android.media.session.PlaybackState
 import android.os.Bundle
+import com.highcapable.kavaref.KavaRef.Companion.resolve
 import com.highcapable.yukihookapi.hook.entity.YukiBaseHooker
 import com.highcapable.yukihookapi.hook.log.YLog
 import io.github.proify.lyricon.lyric.model.LyricWord
@@ -78,6 +79,7 @@ object SmartisanMusic : YukiBaseHooker() {
         private fun hookMediaSession() {
             try {
                 "android.media.session.MediaSession".toClass()
+                    .resolve()
                     .apply {
                         firstMethod {
                             name = "setMetadata"
@@ -138,7 +140,7 @@ object SmartisanMusic : YukiBaseHooker() {
 
         private fun hookNowPlayingLyricsRepository() {
             try {
-                val repoClass = "com.smartisanos.music.playback.NowPlayingLyricsRepository".toClass()
+                val repoClass = "com.smartisanos.music.playback.NowPlayingLyricsRepository".toClass().resolve()
 
                 // Hook peek() — 缓存查询
                 repoClass.method {
@@ -146,9 +148,9 @@ object SmartisanMusic : YukiBaseHooker() {
                 }.forEach { method ->
                     method.hook {
                         after {
-                            val result = this.result ?: return@after
-                            YLog.debug(tag = TAG, msg = "peek() returned: ${result.javaClass.simpleName}")
-                            processEmbeddedLyrics(result)
+                            val returnValue = result ?: return@after
+                            YLog.debug(tag = TAG, msg = "peek() returned: ${returnValue.javaClass.simpleName}")
+                            processEmbeddedLyrics(returnValue)
                         }
                     }
                 }
@@ -159,9 +161,9 @@ object SmartisanMusic : YukiBaseHooker() {
                 }.forEach { method ->
                     method.hook {
                         after {
-                            val result = this.result ?: return@after
-                            YLog.debug(tag = TAG, msg = "load() returned: ${result.javaClass.simpleName}")
-                            processEmbeddedLyrics(result)
+                            val returnValue = result ?: return@after
+                            YLog.debug(tag = TAG, msg = "load() returned: ${returnValue.javaClass.simpleName}")
+                            processEmbeddedLyrics(returnValue)
                         }
                     }
                 }
@@ -236,7 +238,7 @@ object SmartisanMusic : YukiBaseHooker() {
                                 val tokenTimeField = getField(tokenClass, "timestampMs")
                                 val tokenWord = tokenTextField?.get(tokenObj) as? String ?: ""
                                 val tokenBegin = (tokenTimeField?.get(tokenObj) as? Long) ?: 0L
-                                LyricWord(tokenWord, tokenBegin)
+                                LyricWord(begin = tokenBegin, text = tokenWord)
                             } catch (_: Exception) {
                                 null
                             }
