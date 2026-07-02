@@ -7,7 +7,7 @@
 <resources>
 
     <string-array name="xposed_scope">
-        <item>com.smartisanos.music</item>
+        <item>app.smartisanmusic.revived</item>
     </string-array>
 
     <string-array name="lyricon_module_tags">
