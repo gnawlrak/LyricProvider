@@ -140,29 +140,34 @@ object SmartisanMusic : YukiBaseHooker() {
 
         private fun hookNowPlayingLyricsRepository() {
             try {
-                val repoClass = "com.smartisanos.music.playback.NowPlayingLyricsRepository".toClass().resolve()
+                // 使用 appClassLoader 加载内部类
+                val repoClass = "com.smartisanos.music.playback.NowPlayingLyricsRepository".toClass(appClassLoader)
+                    .resolve()
+                YLog.info(tag = TAG, msg = "NowPlayingLyricsRepository found: $repoClass")
 
-                // Hook peek() — 缓存查询
+                // Hook peek(MediaItem) — 缓存查询
                 repoClass.method {
                     name = "peek"
                 }.forEach { method ->
+                    YLog.info(tag = TAG, msg = "Hooking peek method")
                     method.hook {
                         after {
                             val returnValue = result ?: return@after
-                            YLog.debug(tag = TAG, msg = "peek() returned: ${returnValue.javaClass.simpleName}")
+                            YLog.info(tag = TAG, msg = "peek() returned: ${returnValue.javaClass.simpleName}")
                             processEmbeddedLyrics(returnValue)
                         }
                     }
                 }
 
-                // Hook load() — 异步加载
+                // Hook load(Context, MediaItem, boolean) — 异步加载 (suspend 函数)
                 repoClass.method {
                     name = "load"
                 }.forEach { method ->
+                    YLog.info(tag = TAG, msg = "Hooking load method")
                     method.hook {
                         after {
                             val returnValue = result ?: return@after
-                            YLog.debug(tag = TAG, msg = "load() returned: ${returnValue.javaClass.simpleName}")
+                            YLog.info(tag = TAG, msg = "load() returned: ${returnValue.javaClass.simpleName}")
                             processEmbeddedLyrics(returnValue)
                         }
                     }
@@ -171,6 +176,30 @@ object SmartisanMusic : YukiBaseHooker() {
                 YLog.info(tag = TAG, msg = "NowPlayingLyricsRepository hooks installed")
             } catch (e: Exception) {
                 YLog.warn(tag = TAG, msg = "NowPlayingLyricsRepository not found: ${e.message}")
+            }
+
+            // 后备方案：直接 hook loadEmbeddedLyrics 函数
+            try {
+                val embeddedLyricsKt = "com.smartisanos.music.playback.EmbeddedLyricsKt".toClass(appClassLoader)
+                    .resolve()
+                YLog.info(tag = TAG, msg = "EmbeddedLyricsKt found: $embeddedLyricsKt")
+
+                embeddedLyricsKt.method {
+                    name = "loadEmbeddedLyrics"
+                }.forEach { method ->
+                    YLog.info(tag = TAG, msg = "Hooking loadEmbeddedLyrics method")
+                    method.hook {
+                        after {
+                            val returnValue = result ?: return@after
+                            YLog.info(tag = TAG, msg = "loadEmbeddedLyrics returned: ${returnValue.javaClass.simpleName}")
+                            processEmbeddedLyrics(returnValue)
+                        }
+                    }
+                }
+
+                YLog.info(tag = TAG, msg = "EmbeddedLyricsKt hooks installed")
+            } catch (e: Exception) {
+                YLog.warn(tag = TAG, msg = "EmbeddedLyricsKt not found: ${e.message}")
             }
         }
 
