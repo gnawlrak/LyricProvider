@@ -49,11 +49,13 @@ object SmartisanMusic : YukiBaseHooker() {
         private var currentSongDuration: Long = 0
 
         fun onHook() {
-            onAppLifecycle {
-                onCreate { setupProvider() }
-            }
             hookMediaSession()
-            hookNowPlayingLyricsRepository()
+            onAppLifecycle {
+                onCreate {
+                    setupProvider()
+                    hookNowPlayingLyricsRepository()
+                }
+            }
         }
 
         // ---------------------------------- Provider 初始化 ----------------------------------
