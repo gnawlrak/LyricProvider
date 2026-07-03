@@ -29,6 +29,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.serialization.json.Json
 import org.json.JSONObject
 
 /**
@@ -158,12 +159,15 @@ object SmartisanMusic : YukiBaseHooker() {
 
         private fun flushCachedSong() {
             val title = cachedSongTitle ?: return
+            val artist = cachedSongArtist
+            val dur = cachedSongDuration
+            val lyrics = cachedLyrics
             cachedSongTitle = null
             cachedSongArtist = null
             cachedSongDuration = 0
             cachedLyrics = null
-            YLog.info(tag = TAG, msg = "Flushing cached song: $title")
-            pushSongWithLyrics(title, cachedSongArtist, cachedSongDuration, cachedLyrics ?: emptyList())
+            YLog.info(tag = TAG, msg = "Flushing cached song: $title, lyrics=${lyrics?.size ?: 0} lines")
+            pushSongWithLyrics(title, artist, dur, lyrics ?: emptyList())
         }
 
         // ---------------------------------- MediaSession 钩子 ----------------------------------
@@ -404,15 +408,31 @@ object SmartisanMusic : YukiBaseHooker() {
                 id = id,
                 name = title,
                 artist = artist,
-                duration = duration
-            ).apply {
+                duration = duration,
                 lyrics = lines
-            }
+            )
             YLog.info(
                 tag = TAG,
                 msg = "Pushing song: id=$id, title=$title, lyrics=${lines.size} lines, " +
                         "first='${lines.firstOrNull()?.text?.take(30)}'"
             )
+
+            // 诊断：序列化 JSON 快照，验证 lyrics 数据是否完整
+            try {
+                val diagJson = Json {
+                    coerceInputValues = true
+                    ignoreUnknownKeys = true
+                    isLenient = true
+                    explicitNulls = false
+                    encodeDefaults = false
+                }
+                val jsonStr = diagJson.encodeToString(Song.serializer(), song)
+                val snippet = jsonStr.take(600)
+                YLog.info(tag = TAG, msg = "Song JSON: $snippet")
+            } catch (e: Exception) {
+                YLog.warn(tag = TAG, msg = "Song JSON serialization failed: ${e.message}")
+            }
+
             val player = lyricProvider?.player
             if (player == null) {
                 YLog.warn(tag = TAG, msg = "lyricProvider is null, cannot setSong")

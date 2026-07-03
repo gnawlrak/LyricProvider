@@ -22,7 +22,7 @@ configure<ApplicationExtension> {
         minSdk = 28
         targetSdk = rootProject.extra.get("targetSdkVersion") as Int
         versionCode = 1
-        versionName = "1.0.0-beta3"
+        versionName = "1.0.0-beta4"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
