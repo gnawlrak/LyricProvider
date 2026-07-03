@@ -438,6 +438,9 @@ object SmartisanMusic : YukiBaseHooker() {
                 YLog.warn(tag = TAG, msg = "lyricProvider is null, cannot setSong")
                 return
             }
+            // 先设置 playbackState=true，确保 ActivePlayerCoordinator.dispatchIfActive()
+            // 中的 canSwitch 条件（recorderPlaying）满足，否则歌词无法被广播到订阅端。
+            player.setPlaybackState(true)
             val ok = player.setSong(song)
             YLog.info(tag = TAG, msg = "setSong returned: $ok, connected=${isConnected.get()}, status=${lyricProvider?.service?.connectionStatus}")
 
@@ -469,6 +472,7 @@ object SmartisanMusic : YukiBaseHooker() {
                 YLog.warn(tag = TAG, msg = "lyricProvider is null, cannot setSong")
                 return
             }
+            player.setPlaybackState(true)
             val ok = player.setSong(song)
             YLog.info(tag = TAG, msg = "setSong (no lyrics) returned: $ok, connected=${isConnected.get()}, status=${lyricProvider?.service?.connectionStatus}")
 
