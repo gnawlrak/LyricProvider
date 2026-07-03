@@ -313,15 +313,33 @@ object SmartisanMusic : YukiBaseHooker() {
          */
         private fun pushSongWithLyrics(title: String, artist: String?, duration: Long, lines: List<RichLyricLine>) {
             val id = title.hashCode().toString()
+            // 过滤掉没有文本的行（HyperLyric 的 normalize() 会把空文本的行删除）
+            // 保留 [interlude] 形式的空行（用作间奏标记）
+            val validLines = lines.filter { line ->
+                val t = line.text
+                !t.isNullOrBlank()
+            }
+            if (validLines.isEmpty()) {
+                YLog.warn(tag = TAG, msg = "All lines have empty text after filter, fallback to no-lyrics push")
+                pushSongWithoutLyrics(title, artist, duration)
+                return
+            }
             val song = Song(
                 id = id,
                 name = title,
                 artist = artist,
                 duration = duration
             ).apply {
-                lyrics = lines
+                lyrics = validLines
             }
-            YLog.info(tag = TAG, msg = "Pushing song: id=$id, title=$title, lyrics=${lines.size} lines, first='${lines.firstOrNull()?.text}'")
+            val firstText = validLines.firstOrNull()?.text ?: ""
+            val lastText = validLines.lastOrNull()?.text ?: ""
+            YLog.info(
+                tag = TAG,
+                msg = "Pushing song: id=$id, title=$title, lyrics=${validLines.size} lines, " +
+                        "first='$firstText', last='$lastText', " +
+                        "allHaveText=${validLines.count { !it.text.isNullOrBlank() }}/${validLines.size}"
+            )
             val player = lyricProvider?.player
             if (player == null) {
                 YLog.warn(tag = TAG, msg = "lyricProvider is null, cannot setSong")
