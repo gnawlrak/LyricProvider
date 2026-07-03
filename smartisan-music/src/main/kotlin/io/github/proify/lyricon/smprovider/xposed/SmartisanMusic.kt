@@ -12,7 +12,6 @@ import android.os.Bundle
 import com.highcapable.kavaref.KavaRef.Companion.resolve
 import com.highcapable.yukihookapi.hook.entity.YukiBaseHooker
 import com.highcapable.yukihookapi.hook.log.YLog
-import io.github.proify.lyricon.lyric.model.LyricWord
 import io.github.proify.lyricon.lyric.model.RichLyricLine
 import io.github.proify.lyricon.lyric.model.Song
 import io.github.proify.lyricon.provider.LyriconFactory
@@ -20,7 +19,6 @@ import io.github.proify.lyricon.provider.LyriconProvider
 import io.github.proify.lyricon.provider.ProviderLogo
 import io.github.proify.lyricon.smprovider.xposed.Constants.ICON
 import io.github.proify.lyricon.smprovider.xposed.Constants.PROVIDER_PACKAGE_NAME
-import java.lang.reflect.Field
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.Executors
@@ -30,9 +28,9 @@ import org.json.JSONObject
  * 锤子音乐（Smartisan Music Revived）LSP 歌词提供者。
  *
  * 钩子策略：
- * 1. MediaSession.setMetadata() — 获取歌曲信息，扫描 extras 中所有键找歌词
- * 2. NowPlayingLyricsRepository — 拦截已解析的 EmbeddedLyrics 对象
- * 3. MediaSession.setPlaybackState() — 同步播放状态
+ * 1. MediaSession.setMetadata() — 获取歌曲信息，从 extras 拿在线来源
+ * 2. MediaSession.setPlaybackState() — 同步播放状态
+ * 3. 在线歌曲通过网易云音乐 API 主动拉取歌词
  */
 object SmartisanMusic : YukiBaseHooker() {
     private const val TAG = "SmartisanMusicProvider"
@@ -40,17 +38,20 @@ object SmartisanMusic : YukiBaseHooker() {
     private val providerManager by lazy { LyricProviderManager() }
 
     override fun onHook() {
-        // 不限制 processName，确保在所有进程中都生效
         YLog.info(tag = TAG, msg = "onHook called, processName=$processName, packageName=$packageName")
         providerManager.onHook()
     }
 
     private class LyricProviderManager {
         private var lyricProvider: LyriconProvider? = null
-        private var lastSong: Song? = null
         private var currentSongTitle: String? = null
         private var currentSongArtist: String? = null
         private var currentSongDuration: Long = 0
+
+        // 等待异步歌词结果时临时存储当前歌曲
+        @Volatile private var pendingTitle: String? = null
+        @Volatile private var pendingArtist: String? = null
+        @Volatile private var pendingDuration: Long = 0
 
         fun onHook() {
             hookMediaSession()
@@ -107,18 +108,24 @@ object SmartisanMusic : YukiBaseHooker() {
 
                                 if (title == null) return@after
 
-                                if (currentSongTitle == title) return@after
+                                if (currentSongTitle == title) {
+                                    YLog.debug(tag = TAG, msg = "Same song, skip")
+                                    return@after
+                                }
 
                                 currentSongTitle = title
                                 currentSongArtist = artist
                                 currentSongDuration = duration
 
-                                // 1. 尝试从 extras 中扫描歌词 (本地/缓存的歌词)
+                                // 1. 尝试从 extras 中扫描本地歌词
                                 val lyricsFromExtras = extractLyricsFromExtras(metadata)
                                 if (lyricsFromExtras != null) {
-                                    YLog.info(tag = TAG, msg = "Got lyrics from extras (${lyricsFromExtras.take(80)}...)")
-                                    setSongWithLyrics(title, artist, duration, lyricsFromExtras)
-                                    return@after
+                                    YLog.info(tag = TAG, msg = "Got lyrics from extras (${lyricsFromExtras.length} chars)")
+                                    val lines = parseLyricsToRichLines(lyricsFromExtras)
+                                    if (lines.isNotEmpty()) {
+                                        pushSongWithLyrics(title, artist, duration, lines)
+                                        return@after
+                                    }
                                 }
 
                                 // 2. 没有本地歌词，尝试从 extras 拿 online 标识，调用网易 API 拉歌词
@@ -129,8 +136,8 @@ object SmartisanMusic : YukiBaseHooker() {
                                     return@after
                                 }
 
-                                // 3. 都没歌词，先设个空的占位
-                                setSongBasic(title, artist, duration)
+                                // 3. 都没有歌词，发送占位（hyperlyric 才能看到当前在播什么）
+                                pushSongWithoutLyrics(title, artist, duration)
                             }
                         }
 
@@ -140,7 +147,8 @@ object SmartisanMusic : YukiBaseHooker() {
                         }.hook {
                             after {
                                 val state = args[0] as? PlaybackState
-                                lyricProvider?.player?.setPlaybackState(state)
+                                val ok = lyricProvider?.player?.setPlaybackState(state) == true
+                                YLog.debug(tag = TAG, msg = "setPlaybackState forwarded: ok=$ok")
                             }
                         }
                     }
@@ -173,31 +181,46 @@ object SmartisanMusic : YukiBaseHooker() {
 
         /**
          * 主动从网易云拉歌词。
-         * 在线歌曲 release 版被 R8 混淆了内部类，没法 hook 内部 lyric 仓库，所以直接走网络。
          */
         private fun fetchOnlineLyrics(source: String, trackId: String, title: String, artist: String?, duration: Long) {
+            // 缓存当前歌曲元数据，等异步回来后用
+            pendingTitle = title
+            pendingArtist = artist
+            pendingDuration = duration
+
             ioExecutor.execute {
                 try {
                     val lrc = when (source) {
                         "netease", "Netease", "NETEASE" -> fetchNeteaseLyric(trackId)
                         else -> {
-                            YLog.info(tag = TAG, msg = "Unsupported online source: $source, fallback to search")
-                            // 其他源可以用 title+artist 搜索网易云（暂未实现）
+                            YLog.info(tag = TAG, msg = "Unsupported online source: $source")
                             null
                         }
                     }
 
+                    // 如果 pending 已经被新歌曲覆盖，则丢弃本次结果
+                    if (pendingTitle != title) {
+                        YLog.info(tag = TAG, msg = "Pending song changed, discard lyrics for $title")
+                        return@execute
+                    }
+
                     if (lrc.isNullOrBlank()) {
                         YLog.warn(tag = TAG, msg = "No lyrics from online API for $title (trackId=$trackId)")
-                        setSongBasic(title, artist, duration)
+                        pushSongWithoutLyrics(title, artist, duration)
                         return@execute
                     }
 
                     YLog.info(tag = TAG, msg = "Got online lyrics (${lrc.length} chars) for $title")
-                    setSongWithLyrics(title, artist, duration, lrc)
+                    val lines = parseLyricsToRichLines(lrc)
+                    if (lines.isNotEmpty()) {
+                        pushSongWithLyrics(title, artist, duration, lines)
+                    } else {
+                        YLog.warn(tag = TAG, msg = "Failed to parse lyrics for $title")
+                        pushSongWithoutLyrics(title, artist, duration)
+                    }
                 } catch (e: Exception) {
                     YLog.warn(tag = TAG, msg = "fetchOnlineLyrics failed: ${e.message}")
-                    setSongBasic(title, artist, duration)
+                    pushSongWithoutLyrics(title, artist, duration)
                 }
             }
         }
@@ -225,7 +248,6 @@ object SmartisanMusic : YukiBaseHooker() {
                 val lrcObj = json.optJSONObject("lrc") ?: return null
                 val lrc = lrcObj.optString("lyric", "")
                 if (lrc.isBlank()) return null
-                // 翻译歌词拼接在原文后
                 val tlyric = json.optJSONObject("tlyric")?.optString("lyric", "").orEmpty()
                 lrc + if (tlyric.isNotBlank()) "\n$tlyric" else ""
             } finally {
@@ -235,10 +257,6 @@ object SmartisanMusic : YukiBaseHooker() {
 
         // ---------------------------------- Extras 歌词提取 ----------------------------------
 
-        /**
-         * 从 MediaMetadata.extras 中扫描所有键，查找歌词内容。
-         * 不依赖硬编码的 key 名，而是扫描所有 extras 键值。
-         */
         private fun extractLyricsFromExtras(metadata: MediaMetadata): String? {
             return try {
                 val extrasField = MediaMetadata::class.java.getDeclaredField("mBundle")
@@ -248,7 +266,6 @@ object SmartisanMusic : YukiBaseHooker() {
                 val keys = bundle.keySet()
                 YLog.debug(tag = TAG, msg = "extras keys: $keys")
 
-                // 先尝试已知的常见键名
                 val knownKeys = listOf(
                     "com.smartisanos.music.extra.ONLINE_WORD_LYRICS",
                     "com.smartisanos.music.extra.ONLINE_LYRICS",
@@ -264,7 +281,7 @@ object SmartisanMusic : YukiBaseHooker() {
                     if (key in keys) {
                         val lyrics = bundle.getString(key)
                         if (lyrics != null && lyrics.contains("[")) {
-                            YLog.info(tag = TAG, msg = "Found lyrics with known key: $key")
+                            YLog.info(tag = TAG, msg = "Found lyrics with known key: $key, length=${lyrics.length}")
                             return lyrics
                         }
                     }
@@ -273,11 +290,10 @@ object SmartisanMusic : YukiBaseHooker() {
                 // 扫描所有键，找包含 LRC 时间标签的内容
                 for (key in keys) {
                     val value = bundle.getString(key) ?: continue
-                    // LRC 格式: 包含 [mm:ss.xx] 或 [mm:ss]
                     if (value.length > 20 && value.contains("[")) {
                         val lrcPattern = Regex("\\[\\d{2}:\\d{2}[.\\d]*\\]")
                         if (lrcPattern.containsMatchIn(value)) {
-                            YLog.info(tag = TAG, msg = "Found lyrics by scanning: key=$key, preview=${value.take(80)}")
+                            YLog.info(tag = TAG, msg = "Found lyrics by scanning: key=$key, length=${value.length}")
                             return value
                         }
                     }
@@ -292,59 +308,48 @@ object SmartisanMusic : YukiBaseHooker() {
 
         // ---------------------------------- Song 设置 ----------------------------------
 
-        @Volatile private var pendingSongId: String? = null
-        @Volatile private var pendingSongName: String? = null
-        @Volatile private var pendingSongArtist: String? = null
-        @Volatile private var pendingSongDuration: Long = 0L
-        @Volatile private var pendingLyrics: List<RichLyricLine>? = null
-
         /**
-         * 当 setMetadata 触发时立刻发布歌曲元数据（无歌词），让 hyperlyric 知道当前在播什么。
+         * 推送带歌词的 Song。优先让 hyperlyric 端能立刻看到完整数据。
          */
-        private fun setSongBasic(title: String, artist: String?, duration: Long) {
+        private fun pushSongWithLyrics(title: String, artist: String?, duration: Long, lines: List<RichLyricLine>) {
             val id = title.hashCode().toString()
-            pendingSongId = id
-            pendingSongName = title
-            pendingSongArtist = artist
-            pendingSongDuration = duration
-            pendingLyrics = null
-            YLog.info(tag = TAG, msg = "Setting song: $title, lyrics=0 lines (pending fetch)")
-            lyricProvider?.player?.setSong(
-                Song(
-                    id = id,
-                    name = title,
-                    artist = artist,
-                    duration = duration
-                )
-            )
+            val song = Song(
+                id = id,
+                name = title,
+                artist = artist,
+                duration = duration
+            ).apply {
+                lyrics = lines
+            }
+            YLog.info(tag = TAG, msg = "Pushing song: id=$id, title=$title, lyrics=${lines.size} lines, first='${lines.firstOrNull()?.text}'")
+            val player = lyricProvider?.player
+            if (player == null) {
+                YLog.warn(tag = TAG, msg = "lyricProvider is null, cannot setSong")
+                return
+            }
+            val ok = player.setSong(song)
+            YLog.info(tag = TAG, msg = "setSong returned: $ok")
         }
 
         /**
-         * 当歌词拉取成功后，发布带歌词的歌曲。
+         * 推送不带歌词的 Song（占位），让 hyperlyric 端知道当前在播什么。
          */
-        private fun setSongWithLyrics(title: String, artist: String?, duration: Long, lyricsText: String) {
-            val lines = parseLyricsToRichLines(lyricsText)
-            if (lines.isEmpty()) {
-                YLog.warn(tag = TAG, msg = "Failed to parse lyrics for $title (no lines)")
+        private fun pushSongWithoutLyrics(title: String, artist: String?, duration: Long) {
+            val id = title.hashCode().toString()
+            val song = Song(
+                id = id,
+                name = title,
+                artist = artist,
+                duration = duration
+            )
+            YLog.info(tag = TAG, msg = "Pushing song (no lyrics): id=$id, title=$title")
+            val player = lyricProvider?.player
+            if (player == null) {
+                YLog.warn(tag = TAG, msg = "lyricProvider is null, cannot setSong")
                 return
             }
-            val id = title.hashCode().toString()
-            pendingSongId = id
-            pendingSongName = title
-            pendingSongArtist = artist
-            pendingSongDuration = duration
-            pendingLyrics = lines
-            YLog.info(tag = TAG, msg = "Setting song: $title, lyrics=${lines.size} lines")
-            lyricProvider?.player?.setSong(
-                Song(
-                    id = id,
-                    name = title,
-                    artist = artist,
-                    duration = duration
-                ).apply {
-                    lyrics = lines
-                }
-            )
+            val ok = player.setSong(song)
+            YLog.info(tag = TAG, msg = "setSong (no lyrics) returned: $ok")
         }
 
         private fun parseLyricsToRichLines(text: String): List<RichLyricLine> {
@@ -363,7 +368,8 @@ object SmartisanMusic : YukiBaseHooker() {
                         )
                     }
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                YLog.warn(tag = TAG, msg = "parseLyricsToRichLines failed: ${e.message}")
                 emptyList()
             }
         }
