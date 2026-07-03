@@ -292,34 +292,59 @@ object SmartisanMusic : YukiBaseHooker() {
 
         // ---------------------------------- Song 设置 ----------------------------------
 
+        @Volatile private var pendingSongId: String? = null
+        @Volatile private var pendingSongName: String? = null
+        @Volatile private var pendingSongArtist: String? = null
+        @Volatile private var pendingSongDuration: Long = 0L
+        @Volatile private var pendingLyrics: List<RichLyricLine>? = null
+
+        /**
+         * 当 setMetadata 触发时立刻发布歌曲元数据（无歌词），让 hyperlyric 知道当前在播什么。
+         */
         private fun setSongBasic(title: String, artist: String?, duration: Long) {
-            val song = Song(
-                id = title.hashCode().toString(),
-                name = title,
-                artist = artist,
-                duration = duration
+            val id = title.hashCode().toString()
+            pendingSongId = id
+            pendingSongName = title
+            pendingSongArtist = artist
+            pendingSongDuration = duration
+            pendingLyrics = null
+            YLog.info(tag = TAG, msg = "Setting song: $title, lyrics=0 lines (pending fetch)")
+            lyricProvider?.player?.setSong(
+                Song(
+                    id = id,
+                    name = title,
+                    artist = artist,
+                    duration = duration
+                )
             )
-            setSong(song)
         }
 
+        /**
+         * 当歌词拉取成功后，发布带歌词的歌曲。
+         */
         private fun setSongWithLyrics(title: String, artist: String?, duration: Long, lyricsText: String) {
             val lines = parseLyricsToRichLines(lyricsText)
-            val song = Song(
-                id = title.hashCode().toString(),
-                name = title,
-                artist = artist,
-                duration = duration
-            ).apply {
-                lyrics = lines
+            if (lines.isEmpty()) {
+                YLog.warn(tag = TAG, msg = "Failed to parse lyrics for $title (no lines)")
+                return
             }
-            setSong(song)
-        }
-
-        private fun setSong(song: Song) {
-            if (lastSong == song) return
-            lastSong = song
-            YLog.info(tag = TAG, msg = "Setting song: ${song.name}, lyrics=${song.lyrics?.size ?: 0} lines")
-            lyricProvider?.player?.setSong(song)
+            val id = title.hashCode().toString()
+            pendingSongId = id
+            pendingSongName = title
+            pendingSongArtist = artist
+            pendingSongDuration = duration
+            pendingLyrics = lines
+            YLog.info(tag = TAG, msg = "Setting song: $title, lyrics=${lines.size} lines")
+            lyricProvider?.player?.setSong(
+                Song(
+                    id = id,
+                    name = title,
+                    artist = artist,
+                    duration = duration
+                ).apply {
+                    lyrics = lines
+                }
+            )
         }
 
         private fun parseLyricsToRichLines(text: String): List<RichLyricLine> {
