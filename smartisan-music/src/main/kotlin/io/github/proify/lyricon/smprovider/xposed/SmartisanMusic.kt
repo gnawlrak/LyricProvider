@@ -363,6 +363,15 @@ object SmartisanMusic : YukiBaseHooker() {
             } catch (e: Throwable) {
                 YLog.warn(tag = TAG, msg = "setPosition(0) failed: ${e.message}")
             }
+
+            // 诊断兜底：通过 sendText 发送原始歌词文本，确保 HyperLyric 端至少能看到纯文本
+            try {
+                val lyricsText = validLines.joinToString("\n") { it.text ?: "" }
+                player.sendText(lyricsText)
+                YLog.info(tag = TAG, msg = "sendText done: ${lyricsText.length} chars, firstLine='${validLines.firstOrNull()?.text?.take(30)}'")
+            } catch (e: Throwable) {
+                YLog.warn(tag = TAG, msg = "sendText failed: ${e.message}")
+            }
         }
 
         /**
