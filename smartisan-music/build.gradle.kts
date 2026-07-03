@@ -28,6 +28,12 @@ configure<ApplicationExtension> {
     }
 
     signingConfigs {
+        getByName("debug") {
+            storeFile = file(System.getProperty("user.home") + "/.android/debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
         create("release") {
             storeFile = file(System.getenv("RELEASE_STORE_FILE") ?: "release.jks")
             storePassword = System.getenv("RELEASE_STORE_PASSWORD")
@@ -38,7 +44,7 @@ configure<ApplicationExtension> {
 
     buildTypes {
         getByName("debug") {
-            // use default debug keystore for local development
+            signingConfig = signingConfigs.getByName("debug")
         }
         getByName("release") {
             signingConfig = signingConfigs.getByName("release")
