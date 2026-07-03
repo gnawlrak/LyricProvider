@@ -340,6 +340,14 @@ object SmartisanMusic : YukiBaseHooker() {
                         "first='$firstText', last='$lastText', " +
                         "allHaveText=${validLines.count { !it.text.isNullOrBlank() }}/${validLines.size}"
             )
+            // 打印每行前几行 text，确认序列化前的数据
+            validLines.take(3).forEachIndexed { i, line ->
+                YLog.info(
+                    tag = TAG,
+                    msg = "  line[$i] text='${line.text}' begin=${line.begin} end=${line.end} " +
+                            "words=${line.words?.size ?: 0}"
+                )
+            }
             val player = lyricProvider?.player
             if (player == null) {
                 YLog.warn(tag = TAG, msg = "lyricProvider is null, cannot setSong")
@@ -347,6 +355,14 @@ object SmartisanMusic : YukiBaseHooker() {
             }
             val ok = player.setSong(song)
             YLog.info(tag = TAG, msg = "setSong returned: $ok")
+
+            // 强制 setPosition(0) 触发位置更新，确保 HyperLyric 端能找到第一行歌词
+            try {
+                val posOk = player.setPosition(0L)
+                YLog.info(tag = TAG, msg = "setPosition(0) returned: $posOk")
+            } catch (e: Throwable) {
+                YLog.warn(tag = TAG, msg = "setPosition(0) failed: ${e.message}")
+            }
         }
 
         /**
