@@ -12,6 +12,8 @@ import android.os.Bundle
 import com.highcapable.kavaref.KavaRef.Companion.resolve
 import com.highcapable.yukihookapi.hook.entity.YukiBaseHooker
 import com.highcapable.yukihookapi.hook.log.YLog
+import io.github.proify.lrckit.LrcParser
+import io.github.proify.lyricon.lyric.model.LyricLine
 import io.github.proify.lyricon.lyric.model.RichLyricLine
 import io.github.proify.lyricon.lyric.model.Song
 import io.github.proify.lyricon.provider.LyriconFactory
@@ -309,45 +311,23 @@ object SmartisanMusic : YukiBaseHooker() {
         // ---------------------------------- Song 设置 ----------------------------------
 
         /**
-         * 推送带歌词的 Song。优先让 hyperlyric 端能立刻看到完整数据。
+         * 推送带歌词的 Song。参照 163-music 的模式：直接用 setSong 推送，不调 setPosition/sendText。
          */
         private fun pushSongWithLyrics(title: String, artist: String?, duration: Long, lines: List<RichLyricLine>) {
             val id = title.hashCode().toString()
-            // 过滤掉没有文本的行（HyperLyric 的 normalize() 会把空文本的行删除）
-            // 保留 [interlude] 形式的空行（用作间奏标记）
-            val validLines = lines.filter { line ->
-                val t = line.text
-                !t.isNullOrBlank()
-            }
-            if (validLines.isEmpty()) {
-                YLog.warn(tag = TAG, msg = "All lines have empty text after filter, fallback to no-lyrics push")
-                pushSongWithoutLyrics(title, artist, duration)
-                return
-            }
             val song = Song(
                 id = id,
                 name = title,
                 artist = artist,
                 duration = duration
             ).apply {
-                lyrics = validLines
+                lyrics = lines
             }
-            val firstText = validLines.firstOrNull()?.text ?: ""
-            val lastText = validLines.lastOrNull()?.text ?: ""
             YLog.info(
                 tag = TAG,
-                msg = "Pushing song: id=$id, title=$title, lyrics=${validLines.size} lines, " +
-                        "first='$firstText', last='$lastText', " +
-                        "allHaveText=${validLines.count { !it.text.isNullOrBlank() }}/${validLines.size}"
+                msg = "Pushing song: id=$id, title=$title, lyrics=${lines.size} lines, " +
+                        "first='${lines.firstOrNull()?.text?.take(30)}'"
             )
-            // 打印每行前几行 text，确认序列化前的数据
-            validLines.take(3).forEachIndexed { i, line ->
-                YLog.info(
-                    tag = TAG,
-                    msg = "  line[$i] text='${line.text}' begin=${line.begin} end=${line.end} " +
-                            "words=${line.words?.size ?: 0}"
-                )
-            }
             val player = lyricProvider?.player
             if (player == null) {
                 YLog.warn(tag = TAG, msg = "lyricProvider is null, cannot setSong")
@@ -355,23 +335,6 @@ object SmartisanMusic : YukiBaseHooker() {
             }
             val ok = player.setSong(song)
             YLog.info(tag = TAG, msg = "setSong returned: $ok")
-
-            // 强制 setPosition(0) 触发位置更新，确保 HyperLyric 端能找到第一行歌词
-            try {
-                val posOk = player.setPosition(0L)
-                YLog.info(tag = TAG, msg = "setPosition(0) returned: $posOk")
-            } catch (e: Throwable) {
-                YLog.warn(tag = TAG, msg = "setPosition(0) failed: ${e.message}")
-            }
-
-            // 诊断兜底：通过 sendText 发送原始歌词文本，确保 HyperLyric 端至少能看到纯文本
-            try {
-                val lyricsText = validLines.joinToString("\n") { it.text ?: "" }
-                player.sendText(lyricsText)
-                YLog.info(tag = TAG, msg = "sendText done: ${lyricsText.length} chars, firstLine='${validLines.firstOrNull()?.text?.take(30)}'")
-            } catch (e: Throwable) {
-                YLog.warn(tag = TAG, msg = "sendText failed: ${e.message}")
-            }
         }
 
         /**
@@ -395,21 +358,21 @@ object SmartisanMusic : YukiBaseHooker() {
             YLog.info(tag = TAG, msg = "setSong (no lyrics) returned: $ok")
         }
 
+        /**
+         * 解析歌词文本为 RichLyricLine 列表。参照 163-music 的 toRichLines() 模式：
+         * 用 LrcParser 解析成 LyricLine，再手动构造 RichLyricLine。
+         */
         private fun parseLyricsToRichLines(text: String): List<RichLyricLine> {
             return try {
-                val doc = io.github.proify.lrckit.EnhanceLrcParser.parse(text.trim())
-                if (doc.lines.isNotEmpty()) {
-                    doc.lines
-                } else {
-                    val lrcDoc = io.github.proify.lrckit.LrcParser.parse(text.trim())
-                    lrcDoc.lines.map { line ->
-                        RichLyricLine(
-                            begin = line.begin,
-                            end = line.end,
-                            duration = line.duration,
-                            text = line.text
-                        )
-                    }
+                val lrcDoc = LrcParser.parse(text.trim())
+                lrcDoc.lines.map { line ->
+                    RichLyricLine(
+                        begin = line.begin,
+                        end = line.end,
+                        duration = line.duration,
+                        text = line.text,
+                        words = line.words
+                    )
                 }
             } catch (e: Exception) {
                 YLog.warn(tag = TAG, msg = "parseLyricsToRichLines failed: ${e.message}")
