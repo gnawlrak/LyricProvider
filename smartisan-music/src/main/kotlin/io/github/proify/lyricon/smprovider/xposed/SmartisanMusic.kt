@@ -9,6 +9,8 @@ package io.github.proify.lyricon.smprovider.xposed
 import android.media.MediaMetadata
 import android.media.session.PlaybackState
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import com.highcapable.kavaref.KavaRef.Companion.resolve
 import com.highcapable.yukihookapi.hook.entity.YukiBaseHooker
 import com.highcapable.yukihookapi.hook.log.YLog
@@ -16,6 +18,8 @@ import io.github.proify.lrckit.LrcParser
 import io.github.proify.lyricon.lyric.model.LyricLine
 import io.github.proify.lyricon.lyric.model.RichLyricLine
 import io.github.proify.lyricon.lyric.model.Song
+import io.github.proify.lyricon.provider.ConnectionListener
+import io.github.proify.lyricon.provider.ConnectionStatus
 import io.github.proify.lyricon.provider.LyriconFactory
 import io.github.proify.lyricon.provider.LyriconProvider
 import io.github.proify.lyricon.provider.ProviderLogo
@@ -24,6 +28,7 @@ import io.github.proify.lyricon.smprovider.xposed.Constants.PROVIDER_PACKAGE_NAM
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import org.json.JSONObject
 
 /**
@@ -55,6 +60,19 @@ object SmartisanMusic : YukiBaseHooker() {
         @Volatile private var pendingArtist: String? = null
         @Volatile private var pendingDuration: Long = 0
 
+        // 重试机制
+        private val mainHandler = Handler(Looper.getMainLooper())
+        private var retryRunnable: Runnable? = null
+        private var retryCount = 0
+        private val isConnected = AtomicBoolean(false)
+        private val maxRetries = 10
+
+        // 缓存的待推送数据（延迟重试时使用）
+        private var cachedSongTitle: String? = null
+        private var cachedSongArtist: String? = null
+        private var cachedSongDuration: Long = 0
+        private var cachedLyrics: List<RichLyricLine>? = null
+
         fun onHook() {
             hookMediaSession()
             onAppLifecycle {
@@ -76,10 +94,76 @@ object SmartisanMusic : YukiBaseHooker() {
                 playerPackageName = application.packageName,
                 logo = ProviderLogo.fromSvg(ICON)
             ).apply {
-                register()
+                val ok = register()
+                YLog.info(tag = TAG, msg = "register() returned: $ok")
+
+                // 添加连接状态监听器
+                service.addConnectionListener(object : ConnectionListener {
+                    override fun onConnected(provider: LyriconProvider) {
+                        YLog.info(tag = TAG, msg = "CONNECTION ESTABLISHED!")
+                        isConnected.set(true)
+                        retryCount = 0
+                        // 连接建立后，CachedRemotePlayer 会自动 sync 缓存数据
+                        // 但为了保险，如果有缓存数据且 setSong 之前失败了，再推一次
+                        flushCachedSong()
+                    }
+
+                    override fun onReconnected(provider: LyriconProvider) {
+                        YLog.info(tag = TAG, msg = "CONNECTION RE-ESTABLISHED!")
+                        isConnected.set(true)
+                        flushCachedSong()
+                    }
+
+                    override fun onDisconnected(provider: LyriconProvider) {
+                        YLog.warn(tag = TAG, msg = "Connection disconnected")
+                        isConnected.set(false)
+                    }
+
+                    override fun onConnectTimeout(provider: LyriconProvider) {
+                        YLog.warn(tag = TAG, msg = "Connection timeout! Current status=${service.connectionStatus}")
+                        isConnected.set(false)
+                        // 超时后自动重试
+                        scheduleRetry()
+                    }
+                })
+
+                val status = service.connectionStatus
+                YLog.info(tag = TAG, msg = "Provider created, connectionStatus=$status, app=${application.packageName}")
             }
 
-            YLog.info(tag = TAG, msg = "Lyricon provider registered, app=${application.packageName}")
+            YLog.info(tag = TAG, msg = "Lyricon provider setup complete, app=${application.packageName}")
+        }
+
+        private fun scheduleRetry() {
+            if (retryCount >= maxRetries) {
+                YLog.warn(tag = TAG, msg = "Max retries ($maxRetries) reached, giving up")
+                return
+            }
+            retryCount++
+            YLog.info(tag = TAG, msg = "Scheduling retry #$retryCount in 5s")
+
+            retryRunnable?.let { mainHandler.removeCallbacks(it) }
+            retryRunnable = Runnable {
+                val provider = lyricProvider ?: return@Runnable
+                YLog.info(tag = TAG, msg = "Retry #$retryCount: unregister + register")
+                provider.unregister()
+                try {
+                    Thread.sleep(500) // 短暂等待
+                } catch (_: InterruptedException) {}
+                val ok = provider.register()
+                YLog.info(tag = TAG, msg = "Retry #$retryCount: register() returned: $ok, status=${provider.service.connectionStatus}")
+            }
+            mainHandler.postDelayed(retryRunnable!!, 5000)
+        }
+
+        private fun flushCachedSong() {
+            val title = cachedSongTitle ?: return
+            cachedSongTitle = null
+            cachedSongArtist = null
+            cachedSongDuration = 0
+            cachedLyrics = null
+            YLog.info(tag = TAG, msg = "Flushing cached song: $title")
+            pushSongWithLyrics(title, cachedSongArtist, cachedSongDuration, cachedLyrics ?: emptyList())
         }
 
         // ---------------------------------- MediaSession 钩子 ----------------------------------
@@ -312,6 +396,7 @@ object SmartisanMusic : YukiBaseHooker() {
 
         /**
          * 推送带歌词的 Song。参照 163-music 的模式：直接用 setSong 推送，不调 setPosition/sendText。
+         * 如果 setSong 返回 false（订阅端未连接），缓存数据并等待连接建立后重发。
          */
         private fun pushSongWithLyrics(title: String, artist: String?, duration: Long, lines: List<RichLyricLine>) {
             val id = title.hashCode().toString()
@@ -334,7 +419,17 @@ object SmartisanMusic : YukiBaseHooker() {
                 return
             }
             val ok = player.setSong(song)
-            YLog.info(tag = TAG, msg = "setSong returned: $ok")
+            YLog.info(tag = TAG, msg = "setSong returned: $ok, connected=${isConnected.get()}, status=${lyricProvider?.service?.connectionStatus}")
+
+            if (!ok) {
+                // 连接未建立，缓存数据等待重连
+                cachedSongTitle = title
+                cachedSongArtist = artist
+                cachedSongDuration = duration
+                cachedLyrics = lines
+                YLog.info(tag = TAG, msg = "Song cached for retry, scheduling re-registration")
+                scheduleRetry()
+            }
         }
 
         /**
@@ -355,7 +450,16 @@ object SmartisanMusic : YukiBaseHooker() {
                 return
             }
             val ok = player.setSong(song)
-            YLog.info(tag = TAG, msg = "setSong (no lyrics) returned: $ok")
+            YLog.info(tag = TAG, msg = "setSong (no lyrics) returned: $ok, connected=${isConnected.get()}, status=${lyricProvider?.service?.connectionStatus}")
+
+            if (!ok) {
+                cachedSongTitle = title
+                cachedSongArtist = artist
+                cachedSongDuration = duration
+                cachedLyrics = null
+                YLog.info(tag = TAG, msg = "Song (no lyrics) cached for retry, scheduling re-registration")
+                scheduleRetry()
+            }
         }
 
         /**
