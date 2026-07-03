@@ -21,6 +21,10 @@ import io.github.proify.lyricon.provider.ProviderLogo
 import io.github.proify.lyricon.smprovider.xposed.Constants.ICON
 import io.github.proify.lyricon.smprovider.xposed.Constants.PROVIDER_PACKAGE_NAME
 import java.lang.reflect.Field
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.concurrent.Executors
+import org.json.JSONObject
 
 /**
  * 锤子音乐（Smartisan Music Revived）LSP 歌词提供者。
@@ -53,7 +57,6 @@ object SmartisanMusic : YukiBaseHooker() {
             onAppLifecycle {
                 onCreate {
                     setupProvider()
-                    hookNowPlayingLyricsRepository()
                 }
             }
         }
@@ -77,6 +80,8 @@ object SmartisanMusic : YukiBaseHooker() {
         }
 
         // ---------------------------------- MediaSession 钩子 ----------------------------------
+
+        private val ioExecutor = Executors.newSingleThreadExecutor { r -> Thread(r, "SmartisanLyricIO").apply { isDaemon = true } }
 
         private fun hookMediaSession() {
             try {
@@ -108,7 +113,7 @@ object SmartisanMusic : YukiBaseHooker() {
                                 currentSongArtist = artist
                                 currentSongDuration = duration
 
-                                // 尝试从 extras 中扫描歌词
+                                // 1. 尝试从 extras 中扫描歌词 (本地/缓存的歌词)
                                 val lyricsFromExtras = extractLyricsFromExtras(metadata)
                                 if (lyricsFromExtras != null) {
                                     YLog.info(tag = TAG, msg = "Got lyrics from extras (${lyricsFromExtras.take(80)}...)")
@@ -116,7 +121,15 @@ object SmartisanMusic : YukiBaseHooker() {
                                     return@after
                                 }
 
-                                // 尚无歌词，后续由 NowPlayingLyricsRepository 钩子补充
+                                // 2. 没有本地歌词，尝试从 extras 拿 online 标识，调用网易 API 拉歌词
+                                val onlineInfo = extractOnlineInfo(metadata)
+                                if (onlineInfo != null) {
+                                    YLog.info(tag = TAG, msg = "Online song detected: source=${onlineInfo.source}, trackId=${onlineInfo.trackId}")
+                                    fetchOnlineLyrics(onlineInfo.source, onlineInfo.trackId, title, artist, duration)
+                                    return@after
+                                }
+
+                                // 3. 都没歌词，先设个空的占位
                                 setSongBasic(title, artist, duration)
                             }
                         }
@@ -138,172 +151,86 @@ object SmartisanMusic : YukiBaseHooker() {
             }
         }
 
-        // ---------------------------------- NowPlayingLyricsRepository 钩子 ----------------------------------
+        private data class OnlineInfo(val source: String, val trackId: String)
 
-        private fun hookNowPlayingLyricsRepository() {
-            try {
-                // 使用 appClassLoader 加载内部类
-                val repoClass = "com.smartisanos.music.playback.NowPlayingLyricsRepository".toClass(appClassLoader)
-                    .resolve()
-                YLog.info(tag = TAG, msg = "NowPlayingLyricsRepository found: $repoClass")
+        /**
+         * 从 extras 中提取在线歌曲来源信息。
+         */
+        private fun extractOnlineInfo(metadata: MediaMetadata): OnlineInfo? {
+            return try {
+                val extrasField = MediaMetadata::class.java.getDeclaredField("mBundle")
+                extrasField.isAccessible = true
+                val bundle = extrasField.get(metadata) as? Bundle ?: return null
 
-                // Hook peek(MediaItem) — 缓存查询
-                repoClass.method {
-                    name = "peek"
-                }.forEach { method ->
-                    YLog.info(tag = TAG, msg = "Hooking peek method")
-                    method.hook {
-                        after {
-                            val returnValue = result ?: return@after
-                            YLog.info(tag = TAG, msg = "peek() returned: ${returnValue.javaClass.simpleName}")
-                            processEmbeddedLyrics(returnValue)
-                        }
-                    }
-                }
-
-                // Hook load(Context, MediaItem, boolean) — 异步加载 (suspend 函数)
-                repoClass.method {
-                    name = "load"
-                }.forEach { method ->
-                    YLog.info(tag = TAG, msg = "Hooking load method")
-                    method.hook {
-                        after {
-                            val returnValue = result ?: return@after
-                            YLog.info(tag = TAG, msg = "load() returned: ${returnValue.javaClass.simpleName}")
-                            processEmbeddedLyrics(returnValue)
-                        }
-                    }
-                }
-
-                YLog.info(tag = TAG, msg = "NowPlayingLyricsRepository hooks installed")
+                val source = bundle.getString("com.smartisanos.music.extra.ONLINE_SOURCE")
+                val trackId = bundle.getString("com.smartisanos.music.extra.ONLINE_TRACK_ID")
+                if (source != null && trackId != null) OnlineInfo(source, trackId) else null
             } catch (e: Exception) {
-                YLog.warn(tag = TAG, msg = "NowPlayingLyricsRepository not found: ${e.message}")
-            }
-
-            // 后备方案：直接 hook loadEmbeddedLyrics 函数
-            try {
-                val embeddedLyricsKt = "com.smartisanos.music.playback.EmbeddedLyricsKt".toClass(appClassLoader)
-                    .resolve()
-                YLog.info(tag = TAG, msg = "EmbeddedLyricsKt found: $embeddedLyricsKt")
-
-                embeddedLyricsKt.method {
-                    name = "loadEmbeddedLyrics"
-                }.forEach { method ->
-                    YLog.info(tag = TAG, msg = "Hooking loadEmbeddedLyrics method")
-                    method.hook {
-                        after {
-                            val returnValue = result ?: return@after
-                            YLog.info(tag = TAG, msg = "loadEmbeddedLyrics returned: ${returnValue.javaClass.simpleName}")
-                            processEmbeddedLyrics(returnValue)
-                        }
-                    }
-                }
-
-                YLog.info(tag = TAG, msg = "EmbeddedLyricsKt hooks installed")
-            } catch (e: Exception) {
-                YLog.warn(tag = TAG, msg = "EmbeddedLyricsKt not found: ${e.message}")
+                YLog.warn(tag = TAG, msg = "Failed to extract online info: ${e.message}")
+                null
             }
         }
 
         /**
-         * 通过反射处理 EmbeddedLyrics 对象。
+         * 主动从网易云拉歌词。
+         * 在线歌曲 release 版被 R8 混淆了内部类，没法 hook 内部 lyric 仓库，所以直接走网络。
          */
-        private fun processEmbeddedLyrics(lyricsObj: Any) {
-            try {
-                val objClass = lyricsObj.javaClass
-                YLog.debug(tag = TAG, msg = "processEmbeddedLyrics: class=${objClass.name}, fields=${objClass.declaredFields.joinToString { it.name }}")
-
-                val linesField = getField(objClass, "lines") ?: return
-                val lines = linesField.get(lyricsObj) as? List<*> ?: return
-                if (lines.isEmpty()) return
-
-                val title = currentSongTitle ?: return
-                val artist = currentSongArtist
-                val duration = currentSongDuration
-
-                val richLines = convertEmbeddedLines(lines)
-                if (richLines.isEmpty()) return
-
-                YLog.info(tag = TAG, msg = "Processed ${richLines.size} lyrics lines for: $title")
-
-                setSong(
-                    Song(
-                        id = title.hashCode().toString(),
-                        name = title,
-                        artist = artist,
-                        duration = duration
-                    ).apply {
-                        lyrics = richLines
-                    }
-                )
-            } catch (e: Exception) {
-                YLog.warn(tag = TAG, msg = "Failed to process EmbeddedLyrics: ${e.message}")
-            }
-        }
-
-        /**
-         * 将 EmbeddedLyricsLine 列表转换为 RichLyricLine 列表。
-         */
-        private fun convertEmbeddedLines(lines: List<*>): List<RichLyricLine> {
-            return lines.mapNotNull { lineObj ->
+        private fun fetchOnlineLyrics(source: String, trackId: String, title: String, artist: String?, duration: Long) {
+            ioExecutor.execute {
                 try {
-                    val lineClass = lineObj?.javaClass ?: return@mapNotNull null
-                    val textField = getField(lineClass, "text")
-                    val timestampField = getField(lineClass, "timestampMs")
-                    val translationField = getField(lineClass, "translation")
-                    val tokensField = getField(lineClass, "tokens")
-
-                    val text = textField?.get(lineObj) as? String ?: ""
-                    val timestampMs = (timestampField?.get(lineObj) as? Long) ?: 0L
-                    val translation = translationField?.get(lineObj) as? String
-
-                    val begin = timestampMs
-                    val end = begin + 5000
-
-                    val tokens = tokensField?.get(lineObj) as? List<*>
-                    val words = if (tokens != null && tokens.isNotEmpty()) {
-                        tokens.mapNotNull { tokenObj ->
-                            try {
-                                val tokenClass = tokenObj?.javaClass ?: return@mapNotNull null
-                                val tokenTextField = getField(tokenClass, "text")
-                                val tokenTimeField = getField(tokenClass, "timestampMs")
-                                val tokenWord = tokenTextField?.get(tokenObj) as? String ?: ""
-                                val tokenBegin = (tokenTimeField?.get(tokenObj) as? Long) ?: 0L
-                                LyricWord(begin = tokenBegin, text = tokenWord)
-                            } catch (_: Exception) {
-                                null
-                            }
+                    val lrc = when (source) {
+                        "netease", "Netease", "NETEASE" -> fetchNeteaseLyric(trackId)
+                        else -> {
+                            YLog.info(tag = TAG, msg = "Unsupported online source: $source, fallback to search")
+                            // 其他源可以用 title+artist 搜索网易云（暂未实现）
+                            null
                         }
-                    } else {
-                        emptyList()
                     }
 
-                    RichLyricLine(
-                        begin = begin,
-                        end = end,
-                        duration = end - begin,
-                        text = text,
-                        translation = translation,
-                        words = words
-                    )
-                } catch (_: Exception) {
-                    null
+                    if (lrc.isNullOrBlank()) {
+                        YLog.warn(tag = TAG, msg = "No lyrics from online API for $title (trackId=$trackId)")
+                        setSongBasic(title, artist, duration)
+                        return@execute
+                    }
+
+                    YLog.info(tag = TAG, msg = "Got online lyrics (${lrc.length} chars) for $title")
+                    setSongWithLyrics(title, artist, duration, lrc)
+                } catch (e: Exception) {
+                    YLog.warn(tag = TAG, msg = "fetchOnlineLyrics failed: ${e.message}")
+                    setSongBasic(title, artist, duration)
                 }
             }
         }
 
-        private fun getField(clazz: Class<*>, name: String): Field? {
-            var current: Class<*>? = clazz
-            while (current != null && current != Any::class.java) {
-                try {
-                    val field = current.getDeclaredField(name)
-                    field.isAccessible = true
-                    return field
-                } catch (_: NoSuchFieldException) {
-                    current = current.superclass
+        private fun fetchNeteaseLyric(trackId: String): String? {
+            val url = URL("https://music.163.com/api/song/lyric?id=$trackId&lv=1&kv=1&tv=-1")
+            val conn = url.openConnection() as HttpURLConnection
+            conn.connectTimeout = 5000
+            conn.readTimeout = 5000
+            conn.requestMethod = "GET"
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36")
+            conn.setRequestProperty("Referer", "https://music.163.com/")
+            return try {
+                val code = conn.responseCode
+                if (code != 200) {
+                    YLog.warn(tag = TAG, msg = "Netease API HTTP $code for trackId=$trackId")
+                    return null
                 }
+                val body = conn.inputStream.bufferedReader().use { it.readText() }
+                val json = JSONObject(body)
+                if (json.optInt("code") != 200) {
+                    YLog.warn(tag = TAG, msg = "Netease API code=${json.optInt("code")} for trackId=$trackId")
+                    return null
+                }
+                val lrcObj = json.optJSONObject("lrc") ?: return null
+                val lrc = lrcObj.optString("lyric", "")
+                if (lrc.isBlank()) return null
+                // 翻译歌词拼接在原文后
+                val tlyric = json.optJSONObject("tlyric")?.optString("lyric", "").orEmpty()
+                lrc + if (tlyric.isNotBlank()) "\n$tlyric" else ""
+            } finally {
+                conn.disconnect()
             }
-            return null
         }
 
         // ---------------------------------- Extras 歌词提取 ----------------------------------
